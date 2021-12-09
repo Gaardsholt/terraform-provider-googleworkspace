@@ -3,10 +3,11 @@ package googleworkspace
 import (
 	"context"
 	"fmt"
-	"google.golang.org/api/googleapi"
 	"log"
 	"strings"
 	"time"
+
+	"google.golang.org/api/googleapi"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
@@ -115,6 +116,12 @@ func resourceGroupMember() *schema.Resource {
 				Type:        schema.TypeString,
 				Computed:    true,
 			},
+			"ignore_exists": {
+				Description: "Ignore if the group member already exists.",
+				Type:        schema.TypeBool,
+				Optional:    true,
+				Default:     false,
+			},
 		},
 	}
 }
@@ -148,8 +155,39 @@ func resourceGroupMemberCreate(ctx context.Context, d *schema.ResourceData, meta
 
 	member, err := membersService.Insert(groupId, &memberObj).Do()
 
+	mee := memberExistsError(err)
+
 	// If we receive a 409 that the member already exists, ignore it, we'll import it next
-	if err != nil {
+	if err != nil && !mee {
+		return diag.FromErr(err)
+	}
+
+	if mee && d.Get("ignore_exists").(bool) && d.Get("member_id").(string) == "" {
+		log.Printf("[DEBUG] Group Member %q already exists, ignoring", email)
+
+		usersService, diags := GetUsersService(directoryService)
+		if diags.HasError() {
+			return diags
+		}
+
+		user, err := usersService.Get(d.Get("email").(string)).Do()
+		if err != nil {
+			return diag.FromErr(err)
+		}
+		member = &directory.Member{
+			Email:            user.PrimaryEmail,
+			Etag:             user.Etag,
+			Id:               user.Id,
+			Kind:             user.Kind,
+			ServerResponse:   user.ServerResponse,
+			ForceSendFields:  user.ForceSendFields,
+			NullFields:       user.NullFields,
+			Status:           "ACTIVE",
+			DeliverySettings: d.Get("delivery_settings").(string),
+			Role:             d.Get("role").(string),
+			Type:             d.Get("type").(string),
+		}
+	} else {
 		return diag.FromErr(err)
 	}
 
@@ -355,4 +393,17 @@ func resourceGroupMemberImport(ctx context.Context, d *schema.ResourceData, meta
 	d.Set("member_id", parts[3])
 
 	return []*schema.ResourceData{d}, nil
+}
+
+func memberExistsError(err error) bool {
+	gerr, ok := err.(*googleapi.Error)
+	if !ok {
+		return false
+	}
+
+	if gerr.Code == 409 && strings.Contains(gerr.Body, "Member already exists") {
+		log.Printf("[DEBUG] Dismissed an error based on error code: %s", err)
+		return true
+	}
+	return false
 }
